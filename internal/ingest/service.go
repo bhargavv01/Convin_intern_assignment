@@ -85,10 +85,15 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 	if err := s.store.UpsertCall(ctx, rec); err != nil {
 		return err
 	}
-	if err := s.store.IncrementAccountStats(ctx, rec.AccountID, rec.DurationSec); err != nil {
-		return err
+
+	// Only completed calls count toward account stats. Failed and no-answer
+	// calls are stored (events + calls tables) but must not inflate totals.
+	if evt.Status == "completed" {
+		if err := s.store.IncrementAccountStats(ctx, rec.AccountID, rec.DurationSec); err != nil {
+			return err
+		}
+		s.cache.Record(rec.AccountID, rec.DurationSec)
 	}
-	s.cache.Record(rec.AccountID, rec.DurationSec)
 
 	// Recordings are slow to fetch, so that part does not block the provider.
 	// Use a detached context: the goroutine outlives the HTTP request, so the

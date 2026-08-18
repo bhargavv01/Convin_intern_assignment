@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/convin/webhook-ingest/internal/config"
+	"github.com/convin/webhook-ingest/internal/redisclient"
 	"github.com/convin/webhook-ingest/internal/testutil"
 )
 
@@ -52,6 +54,19 @@ func eventJSON(eventID, callID, accountID string) string {
 	  "recording_url": "https://recordings.example.com/%s.wav",
 	  "occurred_at":   "2026-08-13T09:12:00Z"
 	}`, eventID, callID, accountID, callID)
+}
+
+// eventJSONWithStatus builds a payload with an explicit status.
+func eventJSONWithStatus(eventID, callID, accountID, status string, durationSec int) string {
+	return fmt.Sprintf(`{
+	  "event_id":      %q,
+	  "call_id":       %q,
+	  "account_id":    %q,
+	  "status":        %q,
+	  "duration_sec":  %d,
+	  "recording_url": "",
+	  "occurred_at":   "2026-08-13T09:12:00Z"
+	}`, eventID, callID, accountID, status, durationSec)
 }
 
 func post(t *testing.T, url, body string) *http.Response {
@@ -159,5 +174,83 @@ func TestConcurrentDuplicateDoesNotDoubleCount(t *testing.T) {
 	if stats.CallCount != 1 || stats.TotalDurationSec != 143 {
 		t.Fatalf("double-counted: CallCount=%d Duration=%d, want 1/143",
 			stats.CallCount, stats.TotalDurationSec)
+	}
+}
+
+// TestFailedCallDoesNotInflateStats sends one completed, one failed, and one
+// no_answer call for the same account. Before the fix, Ingest increments
+// account_stats on every status, so all three calls would be counted —
+// giving CallCount=3 and TotalDurationSec=155 instead of 1/143.
+func TestFailedCallDoesNotInflateStats(t *testing.T) {
+	srv, st := testutil.NewServer(t)
+	ctx := context.Background()
+
+	// Derive a unique account ID for this test.
+	_, _, accountID := testutil.IDs(t, st)
+
+	cases := []struct {
+		status      string
+		durationSec int
+	}{
+		{"completed", 143},
+		{"failed", 0},
+		{"no_answer", 12},
+	}
+
+	// Build all event/call IDs and pre-clean Redis + Postgres so the test
+	// is idempotent even when rerun without a fresh database.
+	type testEvent struct {
+		evtID  string
+		callID string
+		status string
+		dur    int
+	}
+	events := make([]testEvent, len(cases))
+	for i, tc := range cases {
+		events[i] = testEvent{
+			evtID:  fmt.Sprintf("evt_%s_%d", t.Name(), i),
+			callID: fmt.Sprintf("call_%s_%d", t.Name(), i),
+			status: tc.status,
+			dur:    tc.durationSec,
+		}
+	}
+
+	// Clean up any leftover data from a previous run.
+	cfg := config.Load()
+	rdb, err := redisclient.New(ctx, cfg.RedisAddr)
+	if err == nil {
+		for _, e := range events {
+			_ = rdb.Del(ctx, "dedup:"+e.evtID).Err()
+		}
+		t.Cleanup(func() {
+			for _, e := range events {
+				_ = rdb.Del(ctx, "dedup:"+e.evtID).Err()
+			}
+			_ = rdb.Close()
+		})
+	}
+	for _, e := range events {
+		_, _ = st.Pool().Exec(ctx, `DELETE FROM events WHERE event_id = $1`, e.evtID)
+		_, _ = st.Pool().Exec(ctx, `DELETE FROM calls WHERE call_id = $1`, e.callID)
+	}
+
+	for _, e := range events {
+		body := eventJSONWithStatus(e.evtID, e.callID, accountID, e.status, e.dur)
+		if resp := post(t, srv.URL+"/webhooks/calls", body); resp.StatusCode != http.StatusOK {
+			t.Fatalf("status %s: got %d, want 200", e.status, resp.StatusCode)
+		}
+	}
+
+	// Only the "completed" call should be counted.
+	stats, err := st.AccountStats(ctx, accountID)
+	if err != nil {
+		t.Fatalf("AccountStats: %v", err)
+	}
+	if stats.CallCount != 1 {
+		t.Fatalf("CallCount=%d, want 1 (failed/no_answer inflated stats)", stats.CallCount)
+	}
+	if stats.TotalDurationSec != 143 {
+		t.Fatalf("TotalDurationSec=%d, want 143 (failed/no_answer inflated stats)",
+			stats.TotalDurationSec)
 	}
 }
