@@ -73,10 +73,13 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 	s.cache.Record(rec.AccountID, rec.DurationSec)
 
 	// Recordings are slow to fetch, so that part does not block the provider.
+	// Use a detached context: the goroutine outlives the HTTP request, so the
+	// request context would be cancelled before the work finishes.
 	if rec.RecordingURL != "" {
 		go func() {
-			if err := s.processRecording(ctx, rec); err != nil {
-				// TODO: handle
+			bgCtx := context.Background()
+			if err := s.processRecording(bgCtx, rec); err != nil {
+				s.log.Error("processRecording failed", "call_id", rec.CallID, "err", err)
 			}
 		}()
 	}

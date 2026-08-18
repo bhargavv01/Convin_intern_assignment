@@ -6,9 +6,39 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/convin/webhook-ingest/internal/testutil"
 )
+
+// TestRecordingIsProcessedAfterResponse proves the background recording
+// goroutine actually finishes its work. Before the fix this fails because
+// the goroutine inherits the HTTP request context, which is cancelled as
+// soon as the handler writes the 200 response — so MarkRecordingProcessed
+// runs against a dead context and silently fails.
+func TestRecordingIsProcessedAfterResponse(t *testing.T) {
+	srv, st := testutil.NewServer(t)
+	eventID, callID, accountID := testutil.IDs(t, st)
+	ctx := context.Background()
+
+	body := eventJSON(eventID, callID, accountID) // has a recording_url
+	if resp := post(t, srv.URL+"/webhooks/calls", body); resp.StatusCode != http.StatusOK {
+		t.Fatalf("got %d, want 200", resp.StatusCode)
+	}
+
+	// The background work is 50ms. Give it plenty of time.
+	time.Sleep(200 * time.Millisecond)
+
+	var processed bool
+	row := st.Pool().QueryRow(ctx,
+		`SELECT recording_processed FROM calls WHERE call_id = $1`, callID)
+	if err := row.Scan(&processed); err != nil {
+		t.Fatalf("scan recording_processed: %v", err)
+	}
+	if !processed {
+		t.Fatal("recording_processed is still false — background goroutine failed (likely cancelled context)")
+	}
+}
 
 // eventJSON builds a well-formed call-completion payload.
 func eventJSON(eventID, callID, accountID string) string {
