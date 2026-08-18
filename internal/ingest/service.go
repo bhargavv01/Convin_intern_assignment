@@ -34,15 +34,25 @@ func (s *Service) Stats(accountID string) stats.AccountStats {
 	return s.cache.Get(accountID)
 }
 
+// dedupTTL is how long Redis remembers a seen event_id.
+const dedupTTL = 24 * time.Hour
+
 // Ingest stores a delivery and kicks off processing. Processing runs
 // asynchronously so the provider gets a fast acknowledgement.
+//
+// Deduplication is two-layered:
+//  1. Redis SETNX — atomic, sub-millisecond, eliminates the TOCTOU race.
+//  2. Postgres UNIQUE + ON CONFLICT DO NOTHING — durable safety net in case
+//     Redis is momentarily unavailable or the process crashes between layers.
 func (s *Service) Ingest(ctx context.Context, evt Event) error {
-	exists, err := s.store.EventExists(ctx, evt.EventID)
+	// ── Layer 1: Redis fast-path dedup ──
+	dedupKey := "dedup:" + evt.EventID
+	set, err := s.rdb.SetNX(ctx, dedupKey, 1, dedupTTL).Result()
 	if err != nil {
-		return err
-	}
-	if exists {
-		s.log.Info("duplicate delivery ignored", "event_id", evt.EventID)
+		// Redis is down — fall through to Postgres safety net.
+		s.log.Warn("redis dedup unavailable, falling back to postgres", "err", err)
+	} else if !set {
+		s.log.Info("duplicate delivery ignored (redis)", "event_id", evt.EventID)
 		return nil
 	}
 
@@ -61,9 +71,17 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 		OccurredAt:   evt.OccurredAt,
 		Payload:      payload,
 	}
-	if err := s.store.InsertEvent(ctx, rec); err != nil {
+
+	// ── Layer 2: Postgres safety-net dedup ──
+	inserted, err := s.store.InsertEvent(ctx, rec)
+	if err != nil {
 		return err
 	}
+	if !inserted {
+		s.log.Info("duplicate delivery ignored (postgres)", "event_id", evt.EventID)
+		return nil
+	}
+
 	if err := s.store.UpsertCall(ctx, rec); err != nil {
 		return err
 	}

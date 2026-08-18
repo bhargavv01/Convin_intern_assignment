@@ -37,6 +37,13 @@ func IDs(t *testing.T, s *store.Store) (eventID, callID, accountID string) {
 				t.Fatalf("clean %s: %v", table, err)
 			}
 		}
+
+		// Also clean up Redis keys created for this test's event ID.
+		cfg := config.Load()
+		if rdb, err := redisclient.New(ctx, cfg.RedisAddr); err == nil {
+			_ = rdb.Del(ctx, "dedup:"+eventID).Err()
+			_ = rdb.Close()
+		}
 	}
 	clean()
 	t.Cleanup(clean)

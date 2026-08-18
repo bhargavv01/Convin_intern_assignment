@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -110,5 +111,53 @@ func TestDuplicateDeliveryIsIgnored(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("stored %d copies of %s, want 1", n, eventID)
+	}
+}
+
+// TestConcurrentDuplicateDoesNotDoubleCount fires many identical requests at
+// the same time. Before the fix, the check-then-act pattern (EventExists →
+// InsertEvent) lets every concurrent request slip through the gap, creating
+// multiple event rows and inflating account_stats.
+func TestConcurrentDuplicateDoesNotDoubleCount(t *testing.T) {
+	srv, st := testutil.NewServer(t)
+	eventID, callID, accountID := testutil.IDs(t, st)
+	ctx := context.Background()
+
+	body := eventJSON(eventID, callID, accountID)
+	const concurrent = 10
+	var wg sync.WaitGroup
+	wg.Add(concurrent)
+
+	for i := 0; i < concurrent; i++ {
+		go func() {
+			defer wg.Done()
+			resp := post(t, srv.URL+"/webhooks/calls", body)
+			// All should return 200 (accepted or deduped), none should 500.
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("got %d, want 200", resp.StatusCode)
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Only 1 event row should exist.
+	var eventCount int
+	if err := st.Pool().QueryRow(ctx,
+		`SELECT count(*) FROM events WHERE event_id = $1`, eventID,
+	).Scan(&eventCount); err != nil {
+		t.Fatalf("count events: %v", err)
+	}
+	if eventCount != 1 {
+		t.Fatalf("stored %d event rows, want 1 (TOCTOU race)", eventCount)
+	}
+
+	// Stats should reflect exactly 1 call.
+	stats, err := st.AccountStats(ctx, accountID)
+	if err != nil {
+		t.Fatalf("AccountStats: %v", err)
+	}
+	if stats.CallCount != 1 || stats.TotalDurationSec != 143 {
+		t.Fatalf("double-counted: CallCount=%d Duration=%d, want 1/143",
+			stats.CallCount, stats.TotalDurationSec)
 	}
 }
