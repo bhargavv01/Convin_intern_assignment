@@ -30,5 +30,12 @@ Testcase: TestConcurrentDuplicateDoesNotDoubleCount() in service_test.go
 
 Testcase: TestFailedCallDoesNotInflateStats() in service_test.go
 
+## 4. Data race crash in stats cache ("duplicate call records are showing up in the dashboard")
 
+**Symptom**: Under concurrent webhook traffic the service panics with `fatal error: concurrent map read and map write` or silently loses updates — dashboard stats become inconsistent / duplicated.
 
+**Cause**: In `cache.go`, `Cache.Get` correctly holds `c.mu.RLock()`, but `Cache.Record` acquires **no lock at all**. When multiple HTTP requests call `Record` and `Get` concurrently on the same account, Go's runtime detects a simultaneous map read and map write and crashes the process. Even when it doesn't crash, the unsynchronised increments (`CallCount++`, `TotalDurationSec +=`) cause lost updates.
+
+**Fix**: Add `c.mu.Lock()` / `defer c.mu.Unlock()` at the top of `Cache.Record`, making it the exclusive writer while `Get` remains a shared reader via `RLock`.
+
+Testcase: TestCacheConcurrentRecordAndGet() in cache_test.go
